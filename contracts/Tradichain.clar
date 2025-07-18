@@ -5,10 +5,17 @@
 (define-constant err-invalid-data (err u103))
 (define-constant err-unauthorized (err u104))
 (define-constant err-invalid-category (err u105))
+(define-constant err-insufficient-payment (err u107))
+(define-constant err-not-for-sale (err u108))
+(define-constant err-invalid-price (err u109))
+(define-constant err-cannot-buy-own-artifact (err u110))
+(define-constant err-transfer-failed (err u111))
 
 (define-data-var next-artifact-id uint u1)
 (define-data-var next-curator-id uint u1)
 (define-data-var contract-paused bool false)
+(define-data-var next-listing-id uint u1)
+(define-data-var marketplace-fee-rate uint u250)
 
 (define-map artifacts
   { artifact-id: uint }
@@ -24,7 +31,10 @@
     block-height: uint,
     verified: bool,
     vote-count: uint,
-    access-level: uint
+    access-level: uint,
+    for-sale: bool,
+    sale-price: uint,
+    owner: principal
   }
 )
 
@@ -64,6 +74,39 @@
 (define-map user-contributions
   { user: principal }
   { total-artifacts: uint, total-votes: uint, reputation: uint }
+)
+
+(define-map marketplace-listings
+  { listing-id: uint }
+  {
+    artifact-id: uint,
+    seller: principal,
+    price: uint,
+    listed-at: uint,
+    active: bool,
+    expires-at: uint
+  }
+)
+
+(define-map artifact-sales-history
+  { artifact-id: uint, sale-id: uint }
+  {
+    seller: principal,
+    buyer: principal,
+    price: uint,
+    sold-at: uint,
+    marketplace-fee: uint
+  }
+)
+
+(define-map user-earnings
+  { user: principal }
+  { total-sales: uint, total-earned: uint, total-fees-paid: uint }
+)
+
+(define-map artifact-listing-lookup
+  { artifact-id: uint }
+  { listing-id: uint }
 )
 
 (define-public (register-curator (name (string-utf8 50)) (specialty (string-ascii 100)))
@@ -162,7 +205,10 @@
         block-height: current-block,
         verified: false,
         vote-count: u0,
-        access-level: access-level
+        access-level: access-level,
+        for-sale: false,
+        sale-price: u0,
+        owner: tx-sender
       }
     )
     
@@ -282,6 +328,189 @@
   )
 )
 
+(define-public (list-artifact-for-sale (artifact-id uint) (price uint) (duration-blocks uint))
+  (let 
+    (
+      (artifact (unwrap! (map-get? artifacts { artifact-id: artifact-id }) err-not-found))
+      (listing-id (var-get next-listing-id))
+      (current-block stacks-block-height)
+      (expires-at (+ current-block duration-blocks))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get owner artifact)) err-unauthorized)
+    (asserts! (not (get for-sale artifact)) err-already-exists)
+    (asserts! (> price u0) err-invalid-price)
+    (asserts! (> duration-blocks u0) err-invalid-data)
+    (asserts! (<= duration-blocks u4320) err-invalid-data)
+    
+    (map-set artifacts
+      { artifact-id: artifact-id }
+      (merge artifact { for-sale: true, sale-price: price })
+    )
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      {
+        artifact-id: artifact-id,
+        seller: tx-sender,
+        price: price,
+        listed-at: current-block,
+        active: true,
+        expires-at: expires-at
+      }
+    )
+    
+    (map-set artifact-listing-lookup
+      { artifact-id: artifact-id }
+      { listing-id: listing-id }
+    )
+    
+    (var-set next-listing-id (+ listing-id u1))
+    (ok listing-id)
+  )
+)
+
+(define-public (update-listing-price (artifact-id uint) (new-price uint))
+  (let 
+    (
+      (artifact (unwrap! (map-get? artifacts { artifact-id: artifact-id }) err-not-found))
+      (listing-lookup (unwrap! (map-get? artifact-listing-lookup { artifact-id: artifact-id }) err-not-found))
+      (listing (unwrap! (map-get? marketplace-listings { listing-id: (get listing-id listing-lookup) }) err-not-found))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get owner artifact)) err-unauthorized)
+    (asserts! (get for-sale artifact) err-not-for-sale)
+    (asserts! (get active listing) err-not-for-sale)
+    (asserts! (> new-price u0) err-invalid-price)
+    (asserts! (<= stacks-block-height (get expires-at listing)) err-not-found)
+    
+    (map-set artifacts
+      { artifact-id: artifact-id }
+      (merge artifact { sale-price: new-price })
+    )
+    
+    (map-set marketplace-listings
+      { listing-id: (get listing-id listing-lookup) }
+      (merge listing { price: new-price })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-listing (artifact-id uint))
+  (let 
+    (
+      (artifact (unwrap! (map-get? artifacts { artifact-id: artifact-id }) err-not-found))
+      (listing-lookup (unwrap! (map-get? artifact-listing-lookup { artifact-id: artifact-id }) err-not-found))
+      (listing (unwrap! (map-get? marketplace-listings { listing-id: (get listing-id listing-lookup) }) err-not-found))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get owner artifact)) err-unauthorized)
+    (asserts! (get for-sale artifact) err-not-for-sale)
+    (asserts! (get active listing) err-not-for-sale)
+    
+    (map-set artifacts
+      { artifact-id: artifact-id }
+      (merge artifact { for-sale: false, sale-price: u0 })
+    )
+    
+    (map-set marketplace-listings
+      { listing-id: (get listing-id listing-lookup) }
+      (merge listing { active: false })
+    )
+    
+    (map-delete artifact-listing-lookup { artifact-id: artifact-id })
+    (ok true)
+  )
+)
+
+(define-public (buy-artifact (artifact-id uint))
+  (let 
+    (
+      (artifact (unwrap! (map-get? artifacts { artifact-id: artifact-id }) err-not-found))
+      (listing-lookup (unwrap! (map-get? artifact-listing-lookup { artifact-id: artifact-id }) err-not-found))
+      (listing (unwrap! (map-get? marketplace-listings { listing-id: (get listing-id listing-lookup) }) err-not-found))
+      (sale-price (get price listing))
+      (marketplace-fee (/ (* sale-price (var-get marketplace-fee-rate)) u10000))
+      (seller-amount (- sale-price marketplace-fee))
+      (current-block stacks-block-height)
+      (sale-id (get vote-count artifact))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (get for-sale artifact) err-not-for-sale)
+    (asserts! (get active listing) err-not-for-sale)
+    (asserts! (<= current-block (get expires-at listing)) err-not-found)
+    (asserts! (not (is-eq tx-sender (get owner artifact))) err-cannot-buy-own-artifact)
+    
+    (unwrap! (stx-transfer? sale-price tx-sender (get seller listing)) err-transfer-failed)
+    
+    (map-set artifacts
+      { artifact-id: artifact-id }
+      (merge artifact { 
+        owner: tx-sender,
+        for-sale: false,
+        sale-price: u0
+      })
+    )
+    
+    (map-set marketplace-listings
+      { listing-id: (get listing-id listing-lookup) }
+      (merge listing { active: false })
+    )
+    
+    (map-set artifact-sales-history
+      { artifact-id: artifact-id, sale-id: sale-id }
+      {
+        seller: (get seller listing),
+        buyer: tx-sender,
+        price: sale-price,
+        sold-at: current-block,
+        marketplace-fee: marketplace-fee
+      }
+    )
+    
+    (let ((seller-earnings (default-to { total-sales: u0, total-earned: u0, total-fees-paid: u0 }
+                                      (map-get? user-earnings { user: (get seller listing) }))))
+      (map-set user-earnings
+        { user: (get seller listing) }
+        (merge seller-earnings { 
+          total-sales: (+ (get total-sales seller-earnings) u1),
+          total-earned: (+ (get total-earned seller-earnings) seller-amount),
+          total-fees-paid: (+ (get total-fees-paid seller-earnings) marketplace-fee)
+        })
+      )
+    )
+    
+    (map-delete artifact-listing-lookup { artifact-id: artifact-id })
+    (ok true)
+  )
+)
+
+(define-public (transfer-artifact (artifact-id uint) (new-owner principal))
+  (let ((artifact (unwrap! (map-get? artifacts { artifact-id: artifact-id }) err-not-found)))
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get owner artifact)) err-unauthorized)
+    (asserts! (not (get for-sale artifact)) err-not-for-sale)
+    (asserts! (not (is-eq tx-sender new-owner)) err-invalid-data)
+    
+    (map-set artifacts
+      { artifact-id: artifact-id }
+      (merge artifact { owner: new-owner })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-marketplace-fee (new-fee-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-fee-rate u1000) err-invalid-data)
+    (var-set marketplace-fee-rate new-fee-rate)
+    (ok new-fee-rate)
+  )
+)
+
 (define-read-only (get-artifact (artifact-id uint))
   (map-get? artifacts { artifact-id: artifact-id })
 )
@@ -338,4 +567,52 @@
     height: stacks-block-height,
     time: (default-to u0 (get-stacks-block-info? time stacks-block-height))
   }
+)
+
+(define-read-only (get-marketplace-listing (listing-id uint))
+  (map-get? marketplace-listings { listing-id: listing-id })
+)
+
+(define-read-only (get-artifact-listing (artifact-id uint))
+  (match (map-get? artifact-listing-lookup { artifact-id: artifact-id })
+    listing-lookup (map-get? marketplace-listings { listing-id: (get listing-id listing-lookup) })
+    none
+  )
+)
+
+(define-read-only (get-artifact-sales-history (artifact-id uint) (sale-id uint))
+  (map-get? artifact-sales-history { artifact-id: artifact-id, sale-id: sale-id })
+)
+
+(define-read-only (get-user-earnings (user principal))
+  (map-get? user-earnings { user: user })
+)
+
+(define-read-only (get-marketplace-stats)
+  {
+    total-listings: (- (var-get next-listing-id) u1),
+    marketplace-fee-rate: (var-get marketplace-fee-rate),
+    contract-owner: contract-owner
+  }
+)
+
+(define-read-only (is-artifact-for-sale (artifact-id uint))
+  (match (map-get? artifacts { artifact-id: artifact-id })
+    artifact (get for-sale artifact)
+    false
+  )
+)
+
+(define-read-only (get-artifact-price (artifact-id uint))
+  (match (map-get? artifacts { artifact-id: artifact-id })
+    artifact (get sale-price artifact)
+    u0
+  )
+)
+
+(define-read-only (get-artifact-owner (artifact-id uint))
+  (match (map-get? artifacts { artifact-id: artifact-id })
+    artifact (some (get owner artifact))
+    none
+  )
 )
