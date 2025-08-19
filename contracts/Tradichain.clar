@@ -10,12 +10,21 @@
 (define-constant err-invalid-price (err u109))
 (define-constant err-cannot-buy-own-artifact (err u110))
 (define-constant err-transfer-failed (err u111))
+(define-constant err-collaboration-exists (err u112))
+(define-constant err-invalid-percentage (err u113))
+(define-constant err-not-collaborator (err u114))
+(define-constant err-collaboration-not-found (err u115))
+(define-constant err-pending-invitations (err u116))
+(define-constant err-invitation-expired (err u117))
+(define-constant err-invalid-role (err u118))
 
 (define-data-var next-artifact-id uint u1)
 (define-data-var next-curator-id uint u1)
 (define-data-var contract-paused bool false)
 (define-data-var next-listing-id uint u1)
 (define-data-var marketplace-fee-rate uint u250)
+(define-data-var next-collaboration-id uint u1)
+(define-data-var collaboration-invitation-duration uint u1440)
 
 (define-map artifacts
   { artifact-id: uint }
@@ -107,6 +116,58 @@
 (define-map artifact-listing-lookup
   { artifact-id: uint }
   { listing-id: uint }
+)
+
+(define-map artifact-collaborations
+  { collaboration-id: uint }
+  {
+    artifact-id: uint,
+    lead-collaborator: principal,
+    total-collaborators: uint,
+    status: uint,
+    created-at: uint,
+    finalized-at: uint,
+    revenue-pool: uint,
+    active: bool
+  }
+)
+
+(define-map collaboration-participants
+  { collaboration-id: uint, participant: principal }
+  {
+    role: uint,
+    contribution-percentage: uint,
+    earnings-claimed: uint,
+    joined-at: uint,
+    active: bool
+  }
+)
+
+(define-map collaboration-invitations
+  { collaboration-id: uint, invitee: principal }
+  {
+    role: uint,
+    percentage: uint,
+    invited-by: principal,
+    invited-at: uint,
+    expires-at: uint,
+    status: uint
+  }
+)
+
+(define-map collaboration-lookup
+  { artifact-id: uint }
+  { collaboration-id: uint }
+)
+
+(define-map collaboration-earnings
+  { collaboration-id: uint }
+  {
+    total-revenue: uint,
+    total-distributed: uint,
+    pending-distribution: uint,
+    last-distribution: uint
+  }
 )
 
 (define-public (register-curator (name (string-utf8 50)) (specialty (string-ascii 100)))
@@ -616,3 +677,311 @@
     none
   )
 )
+
+(define-public (create-collaboration (artifact-id uint))
+  (let 
+    (
+      (artifact (unwrap! (map-get? artifacts { artifact-id: artifact-id }) err-not-found))
+      (collaboration-id (var-get next-collaboration-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get owner artifact)) err-unauthorized)
+    (asserts! (is-none (map-get? collaboration-lookup { artifact-id: artifact-id })) err-collaboration-exists)
+    
+    (map-set artifact-collaborations
+      { collaboration-id: collaboration-id }
+      {
+        artifact-id: artifact-id,
+        lead-collaborator: tx-sender,
+        total-collaborators: u1,
+        status: u1,
+        created-at: current-block,
+        finalized-at: u0,
+        revenue-pool: u0,
+        active: true
+      }
+    )
+    
+    (map-set collaboration-participants
+      { collaboration-id: collaboration-id, participant: tx-sender }
+      {
+        role: u1,
+        contribution-percentage: u10000,
+        earnings-claimed: u0,
+        joined-at: current-block,
+        active: true
+      }
+    )
+    
+    (map-set collaboration-lookup
+      { artifact-id: artifact-id }
+      { collaboration-id: collaboration-id }
+    )
+    
+    (map-set collaboration-earnings
+      { collaboration-id: collaboration-id }
+      {
+        total-revenue: u0,
+        total-distributed: u0,
+        pending-distribution: u0,
+        last-distribution: u0
+      }
+    )
+    
+    (var-set next-collaboration-id (+ collaboration-id u1))
+    (ok collaboration-id)
+  )
+)
+
+(define-public (invite-collaborator 
+  (collaboration-id uint) 
+  (invitee principal) 
+  (role uint) 
+  (percentage uint)
+)
+  (let 
+    (
+      (collaboration (unwrap! (map-get? artifact-collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (current-block stacks-block-height)
+      (expires-at (+ current-block (var-get collaboration-invitation-duration)))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get lead-collaborator collaboration)) err-unauthorized)
+    (asserts! (get active collaboration) err-collaboration-not-found)
+    (asserts! (is-eq (get status collaboration) u1) err-invalid-data)
+    (asserts! (and (>= role u1) (<= role u4)) err-invalid-role)
+    (asserts! (and (> percentage u0) (<= percentage u10000)) err-invalid-percentage)
+    (asserts! (is-none (map-get? collaboration-invitations { collaboration-id: collaboration-id, invitee: invitee })) err-already-exists)
+    (asserts! (is-none (map-get? collaboration-participants { collaboration-id: collaboration-id, participant: invitee })) err-already-exists)
+    
+    (map-set collaboration-invitations
+      { collaboration-id: collaboration-id, invitee: invitee }
+      {
+        role: role,
+        percentage: percentage,
+        invited-by: tx-sender,
+        invited-at: current-block,
+        expires-at: expires-at,
+        status: u1
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (accept-collaboration-invitation (collaboration-id uint))
+  (let 
+    (
+      (invitation (unwrap! (map-get? collaboration-invitations { collaboration-id: collaboration-id, invitee: tx-sender }) err-not-found))
+      (collaboration (unwrap! (map-get? artifact-collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq (get status invitation) u1) err-not-found)
+    (asserts! (<= current-block (get expires-at invitation)) err-invitation-expired)
+    (asserts! (get active collaboration) err-collaboration-not-found)
+    
+    (map-set collaboration-participants
+      { collaboration-id: collaboration-id, participant: tx-sender }
+      {
+        role: (get role invitation),
+        contribution-percentage: (get percentage invitation),
+        earnings-claimed: u0,
+        joined-at: current-block,
+        active: true
+      }
+    )
+    
+    (map-set collaboration-invitations
+      { collaboration-id: collaboration-id, invitee: tx-sender }
+      (merge invitation { status: u2 })
+    )
+    
+    (map-set artifact-collaborations
+      { collaboration-id: collaboration-id }
+      (merge collaboration { total-collaborators: (+ (get total-collaborators collaboration) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (decline-collaboration-invitation (collaboration-id uint))
+  (let 
+    (
+      (invitation (unwrap! (map-get? collaboration-invitations { collaboration-id: collaboration-id, invitee: tx-sender }) err-not-found))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq (get status invitation) u1) err-not-found)
+    
+    (map-set collaboration-invitations
+      { collaboration-id: collaboration-id, invitee: tx-sender }
+      (merge invitation { status: u3 })
+    )
+    (ok true)
+  )
+)
+
+(define-public (finalize-collaboration (collaboration-id uint))
+  (let 
+    (
+      (collaboration (unwrap! (map-get? artifact-collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get lead-collaborator collaboration)) err-unauthorized)
+    (asserts! (is-eq (get status collaboration) u1) err-invalid-data)
+    (asserts! (get active collaboration) err-collaboration-not-found)
+    
+    (map-set artifact-collaborations
+      { collaboration-id: collaboration-id }
+      (merge collaboration { 
+        status: u2,
+        finalized-at: current-block
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (leave-collaboration (collaboration-id uint))
+  (let 
+    (
+      (collaboration (unwrap! (map-get? artifact-collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (participant (unwrap! (map-get? collaboration-participants { collaboration-id: collaboration-id, participant: tx-sender }) err-not-collaborator))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (not (is-eq tx-sender (get lead-collaborator collaboration))) err-unauthorized)
+    (asserts! (get active participant) err-not-collaborator)
+    (asserts! (is-eq (get status collaboration) u1) err-invalid-data)
+    
+    (map-set collaboration-participants
+      { collaboration-id: collaboration-id, participant: tx-sender }
+      (merge participant { active: false })
+    )
+    
+    (map-set artifact-collaborations
+      { collaboration-id: collaboration-id }
+      (merge collaboration { total-collaborators: (- (get total-collaborators collaboration) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (distribute-collaboration-revenue (collaboration-id uint) (amount uint))
+  (let 
+    (
+      (collaboration (unwrap! (map-get? artifact-collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (earnings (unwrap! (map-get? collaboration-earnings { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get lead-collaborator collaboration)) err-unauthorized)
+    (asserts! (is-eq (get status collaboration) u2) err-invalid-data)
+    (asserts! (> amount u0) err-invalid-data)
+    
+    (map-set collaboration-earnings
+      { collaboration-id: collaboration-id }
+      (merge earnings {
+        total-revenue: (+ (get total-revenue earnings) amount),
+        pending-distribution: (+ (get pending-distribution earnings) amount),
+        last-distribution: current-block
+      })
+    )
+    
+    (map-set artifact-collaborations
+      { collaboration-id: collaboration-id }
+      (merge collaboration { revenue-pool: (+ (get revenue-pool collaboration) amount) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-collaboration-earnings (collaboration-id uint))
+  (let 
+    (
+      (collaboration (unwrap! (map-get? artifact-collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (participant (unwrap! (map-get? collaboration-participants { collaboration-id: collaboration-id, participant: tx-sender }) err-not-collaborator))
+      (earnings (unwrap! (map-get? collaboration-earnings { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (user-share (/ (* (get pending-distribution earnings) (get contribution-percentage participant)) u10000))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (get active participant) err-not-collaborator)
+    (asserts! (is-eq (get status collaboration) u2) err-invalid-data)
+    (asserts! (> user-share u0) err-invalid-data)
+    
+    (unwrap! (stx-transfer? user-share (get lead-collaborator collaboration) tx-sender) err-transfer-failed)
+    
+    (map-set collaboration-participants
+      { collaboration-id: collaboration-id, participant: tx-sender }
+      (merge participant { earnings-claimed: (+ (get earnings-claimed participant) user-share) })
+    )
+    
+    (map-set collaboration-earnings
+      { collaboration-id: collaboration-id }
+      (merge earnings { 
+        total-distributed: (+ (get total-distributed earnings) user-share),
+        pending-distribution: (- (get pending-distribution earnings) user-share)
+      })
+    )
+    
+    (map-set artifact-collaborations
+      { collaboration-id: collaboration-id }
+      (merge collaboration { revenue-pool: (- (get revenue-pool collaboration) user-share) })
+    )
+    (ok user-share)
+  )
+)
+
+(define-public (update-participant-percentage (collaboration-id uint) (participant principal) (new-percentage uint))
+  (let 
+    (
+      (collaboration (unwrap! (map-get? artifact-collaborations { collaboration-id: collaboration-id }) err-collaboration-not-found))
+      (participant-data (unwrap! (map-get? collaboration-participants { collaboration-id: collaboration-id, participant: participant }) err-not-collaborator))
+    )
+    (asserts! (not (var-get contract-paused)) (err u106))
+    (asserts! (is-eq tx-sender (get lead-collaborator collaboration)) err-unauthorized)
+    (asserts! (is-eq (get status collaboration) u1) err-invalid-data)
+    (asserts! (and (> new-percentage u0) (<= new-percentage u10000)) err-invalid-percentage)
+    (asserts! (get active participant-data) err-not-collaborator)
+    
+    (map-set collaboration-participants
+      { collaboration-id: collaboration-id, participant: participant }
+      (merge participant-data { contribution-percentage: new-percentage })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-collaboration (collaboration-id uint))
+  (map-get? artifact-collaborations { collaboration-id: collaboration-id })
+)
+
+(define-read-only (get-collaboration-participant (collaboration-id uint) (participant principal))
+  (map-get? collaboration-participants { collaboration-id: collaboration-id, participant: participant })
+)
+
+(define-read-only (get-collaboration-invitation (collaboration-id uint) (invitee principal))
+  (map-get? collaboration-invitations { collaboration-id: collaboration-id, invitee: invitee })
+)
+
+(define-read-only (get-artifact-collaboration (artifact-id uint))
+  (match (map-get? collaboration-lookup { artifact-id: artifact-id })
+    lookup (map-get? artifact-collaborations { collaboration-id: (get collaboration-id lookup) })
+    none
+  )
+)
+
+(define-read-only (get-collaboration-earnings-info (collaboration-id uint))
+  (map-get? collaboration-earnings { collaboration-id: collaboration-id })
+)
+
+(define-read-only (get-collaboration-stats)
+  {
+    total-collaborations: (- (var-get next-collaboration-id) u1),
+    invitation-duration: (var-get collaboration-invitation-duration)
+  }
+)
+
+
